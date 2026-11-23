@@ -1,8 +1,19 @@
-import requests
+import json
+import os
+import time
 from datetime import date
+import requests
 
-TOKEN = "changeme"
-CHAT_ID = "changeme"
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Chybí proměnná prostředí TELEGRAM_BOT_TOKEN.")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SOUBOR_UZIVATELE = os.getenv("USERS_FILE", os.path.join(BASE_DIR, "uzivatele.json"))
+
+# Volitelný výchozí chat_id (např. pro tebe při prvním spuštění), bez nutnosti psát ho do kódu
+vychozi_chat_id_raw = os.getenv("INITIAL_CHAT_ID")
+VYCHOZI_CHAT_ID = int(vychozi_chat_id_raw) if vychozi_chat_id_raw else None
 
 DATA = """
 01 01 |Nový rok|Státní svátek|Den obnovy samostatného českého státu
@@ -371,6 +382,49 @@ DATA = """
 12 30 David
 12 31 Silvestr
 """
+
+# -------- NAČTENÍ UŽIVATELŮ --------
+
+if os.path.exists(SOUBOR_UZIVATELE):
+    with open(SOUBOR_UZIVATELE, "r", encoding="utf-8") as f:
+        uzivatele = set(json.load(f))
+else:
+    uzivatele = {VYCHOZI_CHAT_ID} if VYCHOZI_CHAT_ID is not None else set()
+
+# -------- NOVÍ PŘÍHLÁŠENÍ Z TELEGRAMU --------
+
+updates_url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+try:
+    updates_resp = requests.get(updates_url, timeout=15).json()
+    if updates_resp.get("ok"):
+        last_update_id = None
+        for item in updates_resp["result"]:
+            last_update_id = item["update_id"]
+
+            if "message" in item:
+                chat_id = item["message"]["chat"]["id"]
+                text = item["message"].get("text", "")
+
+                if text == "/stop":
+                    uzivatele.discard(chat_id)
+                    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={
+                        "chat_id": chat_id,
+                        "text": "🔕 Odběr svátků byl zrušen. Pro obnovení napiš /start."
+                    }, timeout=15)
+                elif chat_id not in uzivatele:
+                    uzivatele.add(chat_id)
+                    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={
+                        "chat_id": chat_id,
+                        "text": "👋 Ahoj! Přidal jsem tě do denního rozesílání svátků. Pokud ho budeš chtít kdykoliv vypnout, napiš /stop."
+                    }, timeout=15)
+
+        if last_update_id is not None:
+            requests.get(updates_url, params={"offset": last_update_id + 1}, timeout=15)
+except Exception as e:
+    print(f"Chyba při stahování aktualizací: {e}")
+
+# -------- PARSOVÁNÍ DAT --------
+
 svatky = {}
 
 for line in DATA.strip().splitlines():
@@ -385,7 +439,9 @@ for line in DATA.strip().splitlines():
         continue
 
     svatky[(month, day)] = first_part
-  
+
+# -------- DNES --------
+
 dnes = date.today()
 key = (dnes.month, dnes.day)
 
@@ -394,9 +450,28 @@ if key in svatky:
 else:
     message = f"📅 {dnes.day}.{dnes.month}.\nDnes nemá nikdo svátek."
 
-url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+# -------- ODESLÁNÍ VŠEM --------
 
-requests.post(url, data={
-    "chat_id": CHAT_ID,
-    "text": message
-})
+send_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+aktivni_uzivatele = []
+
+for chat_id in uzivatele:
+    try:
+        resp = requests.post(send_url, data={
+            "chat_id": chat_id,
+            "text": message
+        }, timeout=15).json()
+
+        if resp.get("ok"):
+            aktivni_uzivatele.append(chat_id)
+        elif resp.get("error_code") != 403:
+            aktivni_uzivatele.append(chat_id)
+    except Exception:
+        aktivni_uzivatele.append(chat_id)
+
+    time.sleep(0.05)
+
+# -------- ULOŽENÍ AKTUÁLNÍHO SEZNAMU --------
+
+with open(SOUBOR_UZIVATELE, "w", encoding="utf-8") as f:
+    json.dump(aktivni_uzivatele, f)
